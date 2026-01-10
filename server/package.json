@@ -1,0 +1,15 @@
+{
+  "name": "tecdash-online",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "qrcode": "^1.5.4"
+  }
+}
