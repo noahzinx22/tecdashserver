@@ -23,7 +23,13 @@ function loadDb() {
   try {
     const raw = fs.readFileSync(DB_PATH, "utf-8");
     const data = JSON.parse(raw);
-    return (data && typeof data === "object") ? data : {};
+    const db = (data && typeof data === "object") ? data : {};
+    // Backwards-compatible normalization / migration.
+    for (const k of Object.keys(db)) {
+      db[k] = normalizePlayer(db[k]);
+      db[k].playerId = String(db[k].playerId || k);
+    }
+    return db;
   } catch (_) {
     return {};
   }
@@ -73,6 +79,66 @@ function makeRecoveryCode(nick) {
   return `${prefix}-${randGroup(4)}-${randGroup(4)}`;
 }
 
+
+function clampTs(v, min=0, max=9_000_000_000_000_000) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function safeSkinId(id) {
+  const s = String(id || "").trim();
+  if (!s) return "";
+  if (!/^[a-z0-9_\-]{1,32}$/i.test(s)) return "";
+  return s.toLowerCase();
+}
+
+function safeOwnedSkins(arr) {
+  const out = [];
+  const seen = new Set();
+  const push = (x) => { if (x && !seen.has(x)) { seen.add(x); out.push(x); } };
+
+  if (Array.isArray(arr)) {
+    for (const item of arr) {
+      const sid = safeSkinId(item);
+      if (sid) push(sid);
+      if (out.length >= 64) break;
+    }
+  }
+
+  // Always include default
+  if (!seen.has("default")) out.unshift("default");
+  return out;
+}
+
+function isoToEpochMs(iso) {
+  const t = Date.parse(String(iso || ""));
+  return Number.isFinite(t) ? t : 0;
+}
+
+function normalizePlayer(rec) {
+  const r = (rec && typeof rec === "object") ? rec : {};
+  const out = { ...r };
+
+  out.nick = cleanNick(out.nick) || "Player";
+  out.skinSrc = safeSkinSrc(out.skinSrc);
+
+  out.orbsTotal = clampInt(out.orbsTotal, 0);
+  out.deathsTotal = clampInt(out.deathsTotal, 0);
+
+  out.walletOrbs = clampInt(out.walletOrbs, 0);
+  out.ownedSkins = safeOwnedSkins(out.ownedSkins);
+
+  const baseTs = isoToEpochMs(out.updatedAt) || isoToEpochMs(out.createdAt) || Date.now();
+  out.invUpdatedAt = clampTs(out.invUpdatedAt, 0);
+  if (!out.invUpdatedAt) out.invUpdatedAt = baseTs;
+
+  out.createdAt = String(out.createdAt || nowIso());
+  out.updatedAt = String(out.updatedAt || nowIso());
+  return out;
+}
+
+
 async function qrDataUrl(text) {
   try {
     return await QRCode.toDataURL(text, { margin: 1, scale: 6 });
@@ -92,7 +158,7 @@ app.get("/healthz", (_req, res) => {
 });
 
 app.post("/register", async (req, res) => {
-  const { playerId, token, nick, skinSrc, orbsTotal, deathsTotal } = req.body || {};
+  const { playerId, token, nick, skinSrc, orbsTotal, deathsTotal, walletOrbs, ownedSkins, invUpdatedAt } = req.body || {};
   if (!playerId || !token) return res.status(400).json({ ok:false });
 
   const db = loadDb();
@@ -107,13 +173,39 @@ app.post("/register", async (req, res) => {
 
   const cn = cleanNick(nick);
   const recCode = prev?.recoveryCode || makeRecoveryCode(cn || "TECD");
+
+  const incomingInvAt = clampTs(invUpdatedAt, 0);
+  const prevInvAt = clampTs(prev?.invUpdatedAt, 0);
+
+  // Inventory sync is "newer wins" (prevents wiping server state after a local reset).
+  let finalWallet = clampInt(prev?.walletOrbs ?? 0, 0);
+  let finalOwned = safeOwnedSkins(prev?.ownedSkins);
+  let finalInvAt = prevInvAt || (isoToEpochMs(prev?.updatedAt) || Date.now());
+
+  if (!prev) {
+    finalWallet = clampInt(walletOrbs, 0);
+    finalOwned = safeOwnedSkins(ownedSkins);
+    finalInvAt = incomingInvAt || Date.now();
+  } else if (incomingInvAt > prevInvAt) {
+    finalWallet = clampInt(walletOrbs, 0);
+    finalOwned = safeOwnedSkins(ownedSkins);
+    finalInvAt = incomingInvAt;
+  }
+
   const record = {
     playerId: pid,
     token: tok,
     nick: cn || prev?.nick || "Player",
     skinSrc: safeSkinSrc(skinSrc || prev?.skinSrc),
-    orbsTotal: clampInt(orbsTotal, 0),
-    deathsTotal: clampInt(deathsTotal, 0),
+
+    // Never decrease lifetime stats on the server.
+    orbsTotal: Math.max(clampInt(prev?.orbsTotal ?? 0, 0), clampInt(orbsTotal, 0)),
+    deathsTotal: Math.max(clampInt(prev?.deathsTotal ?? 0, 0), clampInt(deathsTotal, 0)),
+
+    walletOrbs: finalWallet,
+    ownedSkins: finalOwned,
+    invUpdatedAt: finalInvAt,
+
     recoveryCode: recCode,
     createdAt: prev?.createdAt || nowIso(),
     updatedAt: nowIso()
@@ -125,12 +217,15 @@ app.post("/register", async (req, res) => {
   return res.json({
     ok:true,
     recoveryCode: record.recoveryCode,
+    walletOrbs: record.walletOrbs,
+    ownedSkins: record.ownedSkins,
+    invUpdatedAt: record.invUpdatedAt
     // Keep QR generation opt-in (client can request /me)
   });
 });
 
 app.post("/sync", async (req, res) => {
-  const { playerId, token, nick, skinSrc, orbsTotal, deathsTotal } = req.body || {};
+  const { playerId, token, nick, skinSrc, orbsTotal, deathsTotal, walletOrbs, ownedSkins, invUpdatedAt } = req.body || {};
   if (!playerId || !token) return res.status(400).json({ ok:false });
 
   const db = loadDb();
@@ -142,17 +237,49 @@ app.post("/sync", async (req, res) => {
   if (prev.token !== tok) return res.status(401).json({ ok:false, reason:"token_mismatch" });
 
   const cn = cleanNick(nick) || prev.nick;
-  db[pid] = {
+
+  const incomingInvAt = clampTs(invUpdatedAt, 0);
+  const prevInvAt = clampTs(prev?.invUpdatedAt, 0);
+
+  let finalWallet = clampInt(prev?.walletOrbs ?? 0, 0);
+  let finalOwned = safeOwnedSkins(prev?.ownedSkins);
+  let finalInvAt = prevInvAt || (isoToEpochMs(prev?.updatedAt) || Date.now());
+
+  if (incomingInvAt > prevInvAt) {
+    finalWallet = clampInt(walletOrbs, 0);
+    finalOwned = safeOwnedSkins(ownedSkins);
+    finalInvAt = incomingInvAt;
+  }
+
+  const updated = normalizePlayer({
     ...prev,
     nick: cn,
     skinSrc: safeSkinSrc(skinSrc || prev.skinSrc),
-    orbsTotal: clampInt(orbsTotal, 0),
-    deathsTotal: clampInt(deathsTotal, 0),
+
+    // Never decrease lifetime stats.
+    orbsTotal: Math.max(clampInt(prev?.orbsTotal ?? 0, 0), clampInt(orbsTotal, 0)),
+    deathsTotal: Math.max(clampInt(prev?.deathsTotal ?? 0, 0), clampInt(deathsTotal, 0)),
+
+    walletOrbs: finalWallet,
+    ownedSkins: finalOwned,
+    invUpdatedAt: finalInvAt,
+
     updatedAt: nowIso()
-  };
+  });
+
+  db[pid] = updated;
   saveDb(db);
 
-  return res.json({ ok:true });
+  return res.json({
+    ok:true,
+    walletOrbs: updated.walletOrbs,
+    ownedSkins: updated.ownedSkins,
+    invUpdatedAt: updated.invUpdatedAt,
+    orbsTotal: updated.orbsTotal,
+    deathsTotal: updated.deathsTotal,
+    nick: updated.nick,
+    skinSrc: updated.skinSrc
+  });
 });
 
 app.get("/leaderboard", (req, res) => {
@@ -200,7 +327,18 @@ app.get("/me", async (req, res) => {
   if (p.token !== tok) return res.status(401).json({ ok:false });
 
   const dataUrl = await qrDataUrl(p.recoveryCode);
-  res.json({ ok:true, recoveryCode: p.recoveryCode, qrDataUrl: dataUrl });
+  res.json({
+    ok:true,
+    recoveryCode: p.recoveryCode,
+    qrDataUrl: dataUrl,
+    nick: p.nick,
+    skinSrc: p.skinSrc,
+    orbsTotal: p.orbsTotal,
+    deathsTotal: p.deathsTotal,
+    walletOrbs: p.walletOrbs,
+    ownedSkins: p.ownedSkins,
+    invUpdatedAt: p.invUpdatedAt
+  });
 });
 
 app.post("/recover", async (req, res) => {
@@ -225,8 +363,31 @@ app.post("/recover", async (req, res) => {
     token: updated.token,
     nick: updated.nick,
     skinSrc: updated.skinSrc,
+    orbsTotal: updated.orbsTotal,
+    deathsTotal: updated.deathsTotal,
+    walletOrbs: updated.walletOrbs,
+    ownedSkins: updated.ownedSkins,
+    invUpdatedAt: updated.invUpdatedAt,
     recoveryCode: updated.recoveryCode
   });
+});
+
+
+app.post("/delete", (req, res) => {
+  const { playerId, token } = req.body || {};
+  if (!playerId || !token) return res.status(400).json({ ok:false });
+
+  const db = loadDb();
+  const pid = String(playerId);
+  const tok = String(token);
+
+  const prev = db[pid];
+  if (!prev) return res.status(404).json({ ok:false, reason:"not_found" });
+  if (prev.token !== tok) return res.status(401).json({ ok:false, reason:"token_mismatch" });
+
+  delete db[pid];
+  saveDb(db);
+  return res.json({ ok:true });
 });
 
 app.listen(PORT, () => {
